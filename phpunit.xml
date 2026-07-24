@@ -11,6 +11,16 @@
         <testsuite name="Feature">
             <directory>tests/Feature</directory>
         </testsuite>
+        <!--
+            Concurrency tests spawn real parallel processes and therefore cannot
+            run inside the wrapping transaction RefreshDatabase uses. Kept in a
+            separate suite so it can be run on its own; see the README for the
+            exact command. (A literal double hyphen is not legal inside an XML
+            comment, which is why the flag is not written out here.)
+        -->
+        <testsuite name="Concurrency">
+            <directory>tests/Concurrency</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>
@@ -23,14 +33,27 @@
         <env name="BCRYPT_ROUNDS" value="4"/>
         <env name="BROADCAST_CONNECTION" value="null"/>
         <env name="CACHE_STORE" value="array"/>
-        <env name="DB_CONNECTION" value="sqlite"/>
-        <env name="DB_DATABASE" value=":memory:"/>
+
+        <!--
+            MySQL, not SQLite. The engine relies on SELECT ... FOR UPDATE and on
+            enforced CHECK constraints; testing against SQLite would silently
+            skip exactly the guarantees this quest is about.
+            Create it once:  CREATE DATABASE warehouse_inventory_test;
+        -->
+        <env name="DB_CONNECTION" value="mysql"/>
+        <env name="DB_HOST" value="127.0.0.1"/>
+        <env name="DB_PORT" value="3306"/>
+        <env name="DB_DATABASE" value="warehouse_inventory_test"/>
+        <env name="DB_USERNAME" value="root"/>
+        <env name="DB_PASSWORD" value=""/>
         <env name="DB_URL" value=""/>
+
         <env name="MAIL_MAILER" value="array"/>
         <env name="QUEUE_CONNECTION" value="sync"/>
         <env name="SESSION_DRIVER" value="array"/>
-        <env name="PULSE_ENABLED" value="false"/>
-        <env name="TELESCOPE_ENABLED" value="false"/>
-        <env name="NIGHTWATCH_ENABLED" value="false"/>
+
+        <env name="SHIPPING_WEBHOOK_SECRET" value="test-webhook-secret"/>
+        <env name="INVENTORY_RESERVATION_TTL" value="30"/>
+        <env name="INVENTORY_TX_ATTEMPTS" value="3"/>
     </php>
 </phpunit>
