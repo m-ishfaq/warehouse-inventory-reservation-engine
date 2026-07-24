@@ -1,0 +1,722 @@
+{
+  "info": {
+    "name": "Warehouse Inventory Reservation Engine",
+    "description": "Quest #87 — inventory core.\n\nRun the folders in order (00 → 05). Requests capture ids into environment variables as they go, so later requests need no manual editing.\n\nWhat to watch: keep http://localhost:8000/dashboard open while you run these. It polls every 5s, so reservations and shipments appear live.\n\nThe webhook folder signs its own requests with HMAC-SHA256 via a pre-request script — see the script tab on those requests.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Fresh idempotency key per run unless a request pins one explicitly.",
+          "if (!pm.collectionVariables.get('idem_key')) {",
+          "    pm.collectionVariables.set('idem_key', 'pm-' + Date.now());",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000" },
+    { "key": "token", "value": "PASTE_INVENTORY_API_TOKEN" },
+    { "key": "webhook_secret", "value": "change-me-in-production" },
+    { "key": "order_id", "value": "1" },
+    { "key": "order_item_id", "value": "1" },
+    { "key": "product_id", "value": "1" },
+    { "key": "warehouse_id", "value": "1" },
+    { "key": "warehouse_b_id", "value": "2" },
+    { "key": "reservation_id", "value": "" },
+    { "key": "shipment_id", "value": "" },
+    { "key": "provider_ref", "value": "" },
+    { "key": "idem_key", "value": "" },
+    { "key": "event_id", "value": "" },
+    { "key": "wh_ts", "value": "" },
+    { "key": "wh_sig", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "00 — Auth boundary",
+      "item": [
+        {
+          "name": "No token → 401",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/stock", "host": ["{{base_url}}"], "path": ["api", "stock"] },
+            "description": "Every endpoint is closed by default. An unconfigured token denies too — the middleware fails closed rather than open."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401 unauthenticated', () => pm.response.to.have.status(401));",
+                  "pm.test('machine-readable error', () => pm.expect(pm.response.json().error).to.eql('unauthenticated'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Wrong token → 401",
+          "request": {
+            "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "not-the-right-token", "type": "string" }] },
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/stock", "host": ["{{base_url}}"], "path": ["api", "stock"] },
+            "description": "Compared with hash_equals — constant time, so the token cannot be recovered one byte at a time by measuring response latency."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('401', () => pm.response.to.have.status(401));"] }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "01 — Read side",
+      "item": [
+        {
+          "name": "Stock positions",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/api/stock?warehouse_id={{warehouse_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "stock"],
+              "query": [{ "key": "warehouse_id", "value": "{{warehouse_id}}" }]
+            },
+            "description": "available = on_hand - reserved. This is the only number the sales side should ever act on."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const row = pm.response.json().data[0];",
+                  "pm.test('available is derived, never stored', () => {",
+                  "    pm.expect(row.available).to.eql(row.on_hand - row.reserved);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "One position",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/api/stock/{{product_id}}/{{warehouse_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "stock", "{{product_id}}", "{{warehouse_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Movement history (the audit trail)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/api/stock/{{product_id}}/{{warehouse_id}}/movements?limit=50",
+              "host": ["{{base_url}}"],
+              "path": ["api", "stock", "{{product_id}}", "{{warehouse_id}}", "movements"],
+              "query": [{ "key": "limit", "value": "50" }]
+            },
+            "description": "Append-only ledger. Every number the other endpoints return is derivable from this list — that is what `php artisan inventory:verify` proves."
+          }
+        },
+        {
+          "name": "Open reservations",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/reservations", "host": ["{{base_url}}"], "path": ["api", "reservations"] }
+          }
+        },
+        {
+          "name": "Orders that consumed inventory",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/api/orders/consuming-inventory",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "consuming-inventory"]
+            },
+            "description": "Sourced from the ledger, not from order columns. If the two ever disagreed, the ledger would be right by definition."
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 — Reservations",
+      "item": [
+        {
+          "name": "Reserve 3 (with Idempotency-Key)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{idem_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": {{order_id}},\n  \"lines\": [\n    {\n      \"order_item_id\": {{order_item_id}},\n      \"product_id\": {{product_id}},\n      \"warehouse_id\": {{warehouse_id}},\n      \"qty\": 3\n    }\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/reservations", "host": ["{{base_url}}"], "path": ["api", "reservations"] },
+            "description": "Watch the dashboard: reserved goes up by 3, on_hand does NOT move. The goods are still physically present, just spoken for."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('fresh work, not a replay', () => pm.expect(body.replayed).to.be.false);",
+                  "pm.collectionVariables.set('reservation_id', body.data.reservation_ids[0]);",
+                  "console.log('reservation_id =', body.data.reservation_ids[0]);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reserve again, SAME key → replay",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Idempotency-Key", "value": "{{idem_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": {{order_id}},\n  \"lines\": [\n    {\n      \"order_item_id\": {{order_item_id}},\n      \"product_id\": {{product_id}},\n      \"warehouse_id\": {{warehouse_id}},\n      \"qty\": 3\n    }\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/reservations", "host": ["{{base_url}}"], "path": ["api", "reservations"] },
+            "description": "THE test. 200 not 201, replayed:true, and the SAME reservation id. The dashboard must not move — nothing was reserved a second time."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200, not 201', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('flagged as a replay', () => pm.expect(body.replayed).to.be.true);",
+                  "pm.test('same reservation returned', () => {",
+                  "    pm.expect(String(body.data.reservation_ids[0]))",
+                  "      .to.eql(String(pm.collectionVariables.get('reservation_id')));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reserve with NO key → a second reservation",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": {{order_id}},\n  \"lines\": [\n    {\n      \"order_item_id\": {{order_item_id}},\n      \"product_id\": {{product_id}},\n      \"warehouse_id\": {{warehouse_id}},\n      \"qty\": 1\n    }\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/reservations", "host": ["{{base_url}}"], "path": ["api", "reservations"] },
+            "description": "Omitting the key is opting OUT of replay protection — deliberate, and documented. A server-invented key would deduplicate requests the client considers distinct."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('201 — genuinely new', () => pm.response.to.have.status(201));"] }
+            }
+          ]
+        },
+        {
+          "name": "Oversell → 409 with the numbers",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": {{order_id}},\n  \"lines\": [\n    {\n      \"order_item_id\": {{order_item_id}},\n      \"product_id\": {{product_id}},\n      \"warehouse_id\": {{warehouse_id}},\n      \"qty\": 999999\n    }\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/reservations", "host": ["{{base_url}}"], "path": ["api", "reservations"] },
+            "description": "409 with requested / available / shortfall. The client needs the numbers so it can offer a partial order instead of just failing."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409 conflict', () => pm.response.to.have.status(409));",
+                  "const b = pm.response.json();",
+                  "pm.test('machine-readable code', () => pm.expect(b.error).to.eql('insufficient_stock'));",
+                  "pm.test('carries the shortfall', () => pm.expect(b.context).to.have.property('shortfall'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Validation → 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": {{order_id}},\n  \"lines\": [\n    {\n      \"order_item_id\": {{order_item_id}},\n      \"product_id\": {{product_id}},\n      \"warehouse_id\": {{warehouse_id}},\n      \"qty\": 0\n    }\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/reservations", "host": ["{{base_url}}"], "path": ["api", "reservations"] },
+            "description": "Shape validation only. Availability is deliberately NOT validated here — a check outside the lock is stale by the time the lock is taken, and a stale check that passes is worse than no check."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('422', () => pm.response.to.have.status(422));"] }
+            }
+          ]
+        },
+        {
+          "name": "Release the reservation",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"reason\": \"customer_cancelled\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/api/reservations/{{reservation_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "reservations", "{{reservation_id}}"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('stock returned', () => pm.expect(pm.response.json().data.released).to.be.above(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Release AGAIN → 0, not an error",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"reason\": \"customer_cancelled\"\n}" },
+            "url": {
+              "raw": "{{base_url}}/api/reservations/{{reservation_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "reservations", "{{reservation_id}}"]
+            },
+            "description": "The double-clicked cancel button. A settled reservation converges silently instead of erroring — and critically, does NOT return the stock twice."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200, not an error', () => pm.response.to.have.status(200));",
+                  "pm.test('released nothing further', () => pm.expect(pm.response.json().data.released).to.eql(0));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "03 — Shipments",
+      "item": [
+        {
+          "name": "Reserve 5 for shipping",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": {{order_id}},\n  \"lines\": [\n    {\n      \"order_item_id\": {{order_item_id}},\n      \"product_id\": {{product_id}},\n      \"warehouse_id\": {{warehouse_id}},\n      \"qty\": 5\n    }\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/reservations", "host": ["{{base_url}}"], "path": ["api", "reservations"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('reservation_id', pm.response.json().data.reservation_ids[0]);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Ship only 2 of the 5 (partial)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": {{order_id}},\n  \"warehouse_id\": {{warehouse_id}},\n  \"dispatch_now\": true,\n  \"lines\": [\n    {\n      \"reservation_id\": {{reservation_id}},\n      \"qty\": 2\n    }\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/shipments", "host": ["{{base_url}}"], "path": ["api", "shipments"] },
+            "description": "A partial shipment is not a special mode — it is simply requesting fewer units than the reservation holds. The remaining 3 stay reserved and open.\n\nWatch your `queue:work` terminal: the mock carrier rolls a random outcome. Stock only drops when a confirmation lands."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201', () => pm.response.to.have.status(201));",
+                  "const d = pm.response.json().data;",
+                  "pm.collectionVariables.set('shipment_id', d.id);",
+                  "console.log('shipment_id =', d.id, 'status =', d.status);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Shipment detail",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{base_url}}/api/shipments/{{shipment_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "shipments", "{{shipment_id}}"]
+            },
+            "description": "Poll this after the queue runs. `dispatched` = handed to the carrier, outcome unknown, NO stock deducted. That state is recoverable; deducting at dispatch would not have been.\n\nCaptures provider_ref into a variable, so the webhook folder needs no manual editing."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const d = pm.response.json().data;",
+                  "if (d.provider_ref) {",
+                  "    pm.collectionVariables.set('provider_ref', d.provider_ref);",
+                  "    console.log('provider_ref =', d.provider_ref);",
+                  "} else {",
+                  "    console.warn('No provider_ref yet — the shipment has not been dispatched. Run: php artisan shipments:process --shipment=' + d.id + ' --sync');",
+                  "}",
+                  "console.log('status =', d.status);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "04 — Transfers",
+      "item": [
+        {
+          "name": "Transfer free stock → 201",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product_id\": {{product_id}},\n  \"from_warehouse_id\": {{warehouse_id}},\n  \"to_warehouse_id\": {{warehouse_b_id}},\n  \"qty\": 5,\n  \"reason\": \"rebalancing\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/transfers", "host": ["{{base_url}}"], "path": ["api", "transfers"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('201', () => pm.response.to.have.status(201));"] }
+            }
+          ]
+        },
+        {
+          "name": "Transfer reserved stock → 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"product_id\": {{product_id}},\n  \"from_warehouse_id\": {{warehouse_id}},\n  \"to_warehouse_id\": {{warehouse_b_id}},\n  \"qty\": 999999\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/transfers", "host": ["{{base_url}}"], "path": ["api", "transfers"] },
+            "description": "Only the unreserved surplus may move. Reserved stock is pinned to the warehouse that promised it — re-pointing reservations would break carrier routing and any pick list already printed."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('409', () => pm.response.to.have.status(409));",
+                  "pm.test('transfer_not_allowed', () => pm.expect(pm.response.json().error).to.eql('transfer_not_allowed'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "05 — Carrier webhook (self-signing)",
+      "description": "These requests compute their own HMAC-SHA256 signature in a pre-request script, so you can exercise the webhook entirely from Postman.\n\nPREREQUISITE: the shipment must already be dispatched and have a provider_ref. Easiest route:\n  1. set SHIPPING_MOCK_OUTCOME=timeout in .env\n  2. php artisan shipments:process --shipment=<id> --sync\n  3. read provider_ref from `GET /api/shipments/{id}` and paste it into the body below",
+    "item": [
+        {
+          "name": "Signed confirmation → 200 processed",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// One event id per run — reused by the duplicate request below.",
+                  "pm.collectionVariables.set('event_id', 'evt_pm_' + Date.now());",
+                  "",
+                  "// Sign timestamp + raw body, exactly as the middleware verifies it.",
+                  "// replaceIn() is essential: pm.request.body.raw still contains the",
+                  "// {{variables}}, and signing the unresolved text would produce a",
+                  "// signature over different bytes than Postman actually sends.",
+                  "const ts = Math.floor(Date.now() / 1000);",
+                  "const body = pm.variables.replaceIn(pm.request.body.raw);",
+                  "const secret = pm.collectionVariables.get('webhook_secret');",
+                  "const sig = CryptoJS.HmacSHA256(ts + '.' + body, secret).toString(CryptoJS.enc.Hex);",
+                  "",
+                  "pm.collectionVariables.set('wh_ts', ts);",
+                  "pm.collectionVariables.set('wh_sig', sig);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('processed, not a duplicate', () => pm.expect(pm.response.json().status).to.eql('processed'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Shipping-Timestamp", "value": "{{wh_ts}}" },
+              { "key": "X-Shipping-Signature", "value": "{{wh_sig}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"event_id\": \"{{event_id}}\",\n  \"provider_ref\": \"{{provider_ref}}\",\n  \"lines\": [\n    {\n      \"reservation_id\": {{reservation_id}},\n      \"qty\": 2\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/webhooks/shipping/confirm",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhooks", "shipping", "confirm"]
+            },
+            "description": "No bearer token — a third-party carrier cannot hold our operator credentials. It authenticates by signature instead."
+          }
+        },
+        {
+          "name": "Same event again → 200 duplicate_ignored",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Deliberately does NOT regenerate event_id — reusing the previous",
+                  "// one is what makes this a duplicate. Timestamp and signature are",
+                  "// fresh, so this is a genuinely valid request carrying a seen event.",
+                  "const ts = Math.floor(Date.now() / 1000);",
+                  "const body = pm.variables.replaceIn(pm.request.body.raw);",
+                  "const secret = pm.collectionVariables.get('webhook_secret');",
+                  "const sig = CryptoJS.HmacSHA256(ts + '.' + body, secret).toString(CryptoJS.enc.Hex);",
+                  "",
+                  "pm.collectionVariables.set('wh_ts', ts);",
+                  "pm.collectionVariables.set('wh_sig', sig);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 — NOT 4xx', () => pm.response.to.have.status(200));",
+                  "pm.test('recognised as duplicate', () => pm.expect(pm.response.json().status).to.eql('duplicate_ignored'));",
+                  "// NOTE: data.shipped repeats the ORIGINAL figure. That is a replay,",
+                  "// not a second deduction. Proof is the stock level and the ledger:",
+                  "// re-run '01 — Movement history' and count the `ship` movements."
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Shipping-Timestamp", "value": "{{wh_ts}}" },
+              { "key": "X-Shipping-Signature", "value": "{{wh_sig}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"event_id\": \"{{event_id}}\",\n  \"provider_ref\": \"{{provider_ref}}\",\n  \"lines\": [\n    {\n      \"reservation_id\": {{reservation_id}},\n      \"qty\": 2\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/webhooks/shipping/confirm",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhooks", "shipping", "confirm"]
+            },
+            "description": "200, never 4xx. A carrier that receives an error treats delivery as failed and retries forever — 'already handled' is a success."
+          }
+        },
+        {
+          "name": "Forged signature → 401",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Shipping-Timestamp", "value": "{{$timestamp}}" },
+              { "key": "X-Shipping-Signature", "value": "0000000000000000000000000000000000000000000000000000000000000000" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"event_id\": \"evt_forged\",\n  \"provider_ref\": \"{{provider_ref}}\",\n  \"lines\": []\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/webhooks/shipping/confirm",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhooks", "shipping", "confirm"]
+            },
+            "description": "Without a signature this endpoint would be an unauthenticated write that deducts inventory — anyone who learned the URL could drain stock."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401', () => pm.response.to.have.status(401));",
+                  "pm.test('invalid_signature', () => pm.expect(pm.response.json().error).to.eql('invalid_signature'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Stale timestamp → 401",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// A CORRECTLY signed request, just an old one. Without the timestamp",
+                  "// window, a valid request captured off the wire could be replayed",
+                  "// forever.",
+                  "const ts = Math.floor(Date.now() / 1000) - 86400;",
+                  "const body = pm.variables.replaceIn(pm.request.body.raw);",
+                  "const secret = pm.collectionVariables.get('webhook_secret');",
+                  "const sig = CryptoJS.HmacSHA256(ts + '.' + body, secret).toString(CryptoJS.enc.Hex);",
+                  "",
+                  "pm.collectionVariables.set('wh_ts', ts);",
+                  "pm.collectionVariables.set('wh_sig', sig);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('401', () => pm.response.to.have.status(401));",
+                  "pm.test('signature_expired', () => pm.expect(pm.response.json().error).to.eql('signature_expired'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [
+              { "key": "Accept", "value": "application/json" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Shipping-Timestamp", "value": "{{wh_ts}}" },
+              { "key": "X-Shipping-Signature", "value": "{{wh_sig}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"event_id\": \"evt_stale\",\n  \"provider_ref\": \"{{provider_ref}}\",\n  \"lines\": []\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/webhooks/shipping/confirm",
+              "host": ["{{base_url}}"],
+              "path": ["api", "webhooks", "shipping", "confirm"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
